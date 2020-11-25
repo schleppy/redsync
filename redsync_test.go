@@ -47,7 +47,7 @@ func makeCases(poolCount int) map[string]*testCase {
 
 // Maintain separate blocks of servers for each type of driver
 const SERVER_POOLS = 4
-const SERVER_POOL_SIZE = 8
+const SERVER_POOL_SIZE = 2
 const REDIGO_BLOCK = 0
 const GOREDIS_BLOCK = 1
 const GOREDIS_V7_BLOCK = 2
@@ -69,14 +69,33 @@ func TestMain(m *testing.M) {
 }
 
 func TestRedsync(t *testing.T) {
-	for k, v := range makeCases(8) {
+	for k, v := range makeCases(SERVER_POOL_SIZE) {
 		t.Run(k, func(t *testing.T) {
 			rs := New(v.pools...)
 
-			mutex := rs.NewMutex("test-redsync")
+			mutex := rs.NewMutex("test-redsync", WithExpiry(100 * time.Millisecond))
 			_ = mutex.Lock()
 
 			assertAcquired(t, v.pools, mutex)
+		})
+	}
+}
+
+func TestRedsyncReacquire(t *testing.T) {
+	for k, v := range makeCases(SERVER_POOL_SIZE) {
+		t.Run(k, func(t *testing.T) {
+			rs := New(v.pools...)
+
+			mutex := rs.NewMutex("test-redsync", WithExpiry(100 * time.Millisecond))
+			_ = mutex.Lock()
+			assertAcquired(t, v.pools, mutex)
+
+			storedValue := mutex.value
+			reacquiredMutex := rs.NewMutex("test-redsync", WithExpiry(time.Second * 10), WithGenValueFunc(func() (string, error) {
+				return storedValue, nil
+			}))
+			_, _ = reacquiredMutex.Extend()
+			assertExtended(t, v.pools, mutex)
 		})
 	}
 }

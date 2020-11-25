@@ -4,10 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"time"
-
 	"github.com/go-redsync/redsync/v4/redis"
 	"github.com/hashicorp/go-multierror"
+	"time"
 )
 
 // A DelayFunc is used to decide the amount of time to wait between retries.
@@ -16,6 +15,7 @@ type DelayFunc func(tries int) time.Duration
 // A Mutex is a distributed mutual exclusion lock.
 type Mutex struct {
 	name   string
+	locked bool
 	expiry time.Duration
 
 	tries     int
@@ -39,7 +39,7 @@ func (m *Mutex) Lock() error {
 
 // Lock locks m. In case it returns an error on failure, you may retry to acquire the lock by calling this method again.
 func (m *Mutex) LockContext(ctx context.Context) error {
-	value, err := m.genValueFunc()
+	err := m.setValue()
 	if err != nil {
 		return err
 	}
@@ -52,7 +52,7 @@ func (m *Mutex) LockContext(ctx context.Context) error {
 		start := time.Now()
 
 		n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
-			return m.acquire(ctx, pool, value)
+			return m.acquire(ctx, pool, m.value)
 		})
 		if n == 0 && err != nil {
 			return err
@@ -61,12 +61,12 @@ func (m *Mutex) LockContext(ctx context.Context) error {
 		now := time.Now()
 		until := now.Add(m.expiry - now.Sub(start) - time.Duration(int64(float64(m.expiry)*m.factor)))
 		if n >= m.quorum && now.Before(until) {
-			m.value = value
 			m.until = until
+			m.locked = true
 			return nil
 		}
 		_, _ = m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
-			return m.release(ctx, pool, value)
+			return m.release(ctx, pool, m.value)
 		})
 	}
 
@@ -78,8 +78,24 @@ func (m *Mutex) Unlock() (bool, error) {
 	return m.UnlockContext(nil)
 }
 
-// Unlock unlocks m and returns the status of unlock.
+func (m *Mutex) setValue() error {
+	if m.value != "" {
+		return nil
+	}
+	val, err := m.genValueFunc()
+	if err != nil {
+		return err
+	}
+	m.value = val
+	return nil
+}
+
+// UnlockContext unlocks m and returns the status of unlock.
 func (m *Mutex) UnlockContext(ctx context.Context) (bool, error) {
+	err := m.setValue()
+	if err != nil {
+		return false, err
+	}
 	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
 		return m.release(ctx, pool, m.value)
 	})
@@ -94,8 +110,12 @@ func (m *Mutex) Extend() (bool, error) {
 	return m.ExtendContext(nil)
 }
 
-// Extend resets the mutex's expiry and returns the status of expiry extension.
+// ExtendContext resets the mutex's expiry and returns the status of expiry extension.
 func (m *Mutex) ExtendContext(ctx context.Context) (bool, error) {
+	err := m.setValue()
+	if err != nil {
+		return false, err
+	}
 	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
 		return m.touch(ctx, pool, m.value, int(m.expiry/time.Millisecond))
 	})
@@ -105,10 +125,12 @@ func (m *Mutex) ExtendContext(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// Valid returns whether the value stored at m.name is == m.value.
 func (m *Mutex) Valid() (bool, error) {
 	return m.ValidContext(nil)
 }
 
+// ValidContext returns whether the value stored at m.name is == m.value.
 func (m *Mutex) ValidContext(ctx context.Context) (bool, error) {
 	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
 		return m.valid(ctx, pool)
@@ -160,6 +182,9 @@ var deleteScript = redis.NewScript(1, `
 `)
 
 func (m *Mutex) release(ctx context.Context, pool redis.Pool, value string) (bool, error) {
+	if !m.locked {
+		return false, nil
+	}
 	conn, err := pool.Get(ctx)
 	if err != nil {
 		return false, err
@@ -169,7 +194,11 @@ func (m *Mutex) release(ctx context.Context, pool redis.Pool, value string) (boo
 	if err != nil {
 		return false, err
 	}
-	return status != 0, nil
+	released := status == int64(1)
+	if released {
+		m.locked = false
+	}
+	return released, nil
 }
 
 var touchScript = redis.NewScript(1, `
@@ -190,7 +219,11 @@ func (m *Mutex) touch(ctx context.Context, pool redis.Pool, value string, expiry
 	if err != nil {
 		return false, err
 	}
-	return status != "ERR", nil
+	touched := status == int64(1)
+	if touched {
+		m.locked = true
+	}
+	return touched, nil
 }
 
 func (m *Mutex) actOnPoolsAsync(actFn func(redis.Pool) (bool, error)) (int, error) {
